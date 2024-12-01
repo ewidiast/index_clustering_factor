@@ -1,0 +1,233 @@
+ create test tables
+#1 create table customers (customer_id number, name varchar2(50), constraint customer_pk primary key (customer_id));
+
+#2 create table products (product_id number, name varchar2(50), constraint product_pk primary key (product_id));
+
+#3 create table sales (
+	id	number generated always as identity, ---------->> unique number as identity
+	customer_id number,
+	product_id number,
+	quantity number,
+	created_date date,
+	padding_string varchar2(4000),
+	constraint sales_pk primary key (id),
+	constraint sales_customers_fk foreign key (customer_id) references customers(customer_id),
+	constraint sales_products_fk foreign key (product_id) references products(product_id)
+);
+
+ALTER TABLE sales
+MODIFY padding_string varchar2(100);
+
+#4 insert table into customer
+insert into customers
+select level, 'customer_'|| level
+from dual
+connect by level <= 100;
+
+commit
+
+
+#5 insert table into products
+insert into products
+select level, 'customer_'|| level
+from dual
+connect by level <= 10;
+
+commit
+
+#5 insert table into sales
+insert into sales (customer_id, product_id, quantity, created_date, padding_string)
+select trunc(dbms_random.value(1, 101)),trunc(dbms_random.value(1, 11)),trunc(dbms_random.value(1, 51)), sysdate, dbms_random.string('x',100)
+from dual connect by level <= 100000;
+
+commit;
+
+#6 GATHER STATS SALES2
+EXEC DBMS_STATS.gather_table_stats('<OWNER>','SALES2',cascade=>TRUE);
+
+#7 SELECT TABLE SALES -->>  OUR FOCUS STARTS HERE 
+SQL> SELECT customer_id, product_id from SALES where rownum <= 10;
+
+CUSTOMER_ID PRODUCT_ID   
+----------- ---------- 
+         64          9   <<<=== Randomly sort (customer_id)
+         83         10   <<<=== Randomly sort (customer_id)
+         77          1   <<<=== Randomly sort (customer_id)
+         39          9   <<<=== Randomly sort (customer_id)
+         68          6   <<<=== Randomly sort (customer_id)
+         50          5   <<<=== Randomly sort (customer_id)
+         38         10   <<<=== Randomly sort (customer_id)
+          6          5   <<<=== Randomly sort (customer_id)
+         10          9   <<<=== Randomly sort (customer_id)
+         71          7   <<<=== Randomly sort (customer_id)
+
+10 rows selected.
+
+
+#8 create table sales2 as select * from sales;
+
+#9 EXEC DBMS_STATS.gather_table_stats('AIOPS_CLIENT','SALES2',cascade=>TRUE);
+
+#10 create index sales2_cust_idx on sales2 (customer_id);
+
+#11 exec dbms_stats.gather_table_stats(null, 'SALES2');
+
+#12 check Clustering factor of index on CUSTOMER_ID
+
+	SQL> @idx SALES2
+	
+	INDEX_OWNER               TABLE_NAME                INDEX_NAME                COLUMN_NAME                  COL_POS
+	------------------------- ------------------------- ------------------------- ------------------------- ----------
+	AIOPS_CLIENT              SALES2                    SALES2_CUST_IDX           CUSTOMER_ID                        1
+	AIOPS_CLIENT              SALES2                    SALES2_PK                 ID                                 1
+	
+	OWNER 		 TABLE_NAME                INDEX_NAME                VISIBILIT PAR     BLEVEL DISTINCT_KEYS CLUSTERING_FACTOR UNIQUENES   NUM_ROWS LEAF_BLOCKS SAMPLE_SIZE LAST_ANALYZED
+	------------ ------------------------- ------------------------- --------- --- ---------- ------------- ----------------- --------- ---------- ----------- ----------- -------------------
+	AIOPS_CLIENT SALES2                    SALES2_PK                 VISIBLE   NO           1        100000              3468 UNIQUE        100000         208      100000 28-11-2024 22:18:28
+	AIOPS_CLIENT SALES2                    SALES2_CUST_IDX           VISIBLE   NO           1           100             76914 NONUNIQUE     100000         196      100000 28-11-2024 22:18:28  <<<============ high Clustering factor
+
+====>>>> clustering_factor SALES2_CUST_IDX 76914  (quite HIGH, less desirable by optimizer)
+
+#13 Get the execution plan of select statement
+SQL> select /* attempt1 */ * from sales2 where customer_id=1;
+
+1019 rows selected.
+
+SQL_ID  g071y5qy5r7bb, child number 0
+-------------------------------------
+select /* attempt1 */ * from sales2 where customer_id=1
+
+Plan hash value: 497282378
+----------------------------------------------------------------------------
+| Id  | Operation         | Name   | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |        |       |       |   496 (100)|          |
+|*  1 |  TABLE ACCESS FULL| SALES2 |  1019 |   122K|   496   (1)| 00:00:01 |  <<<==== FTS, optimzer wont used index SALES2_CUST_IDX
+----------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter("CUSTOMER_ID"=1)
+
+
+Statistics
+----------------------------------------------------------
+          9  recursive calls
+         20  db block gets
+       1861  consistent gets  <<<<====================
+          0  physical reads
+       3884  redo size
+     135894  bytes sent via SQL*Net to client
+       1154  bytes received via SQL*Net from client
+         69  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+       1019  rows processed
+
+### force using index
+
+select /*+ index(sales2 SALES2_CUST_IDX) */ * from sales2 where customer_id=1;
+
+1019 rows selected.
+
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 1724231519
+-------------------------------------------------------------------------------------------------------
+| Id  | Operation                           | Name            | Rows  | Bytes | Cost (%CPU)| Time     |
+-------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                    |                 |  1019 |   122K|   786   (0)| 00:00:01 |
+|   1 |  TABLE ACCESS BY INDEX ROWID BATCHED| SALES2          |  1019 |   122K|   786   (0)| 00:00:01 |
+|*  2 |   INDEX RANGE SCAN                  | SALES2_CUST_IDX |  1019 |       |     2   (0)| 00:00:01 |  <<<======= using index SALES2_CUST_IDX
+-------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - access("CUSTOMER_ID"=1)
+
+Statistics
+----------------------------------------------------------
+          1  recursive calls
+          0  db block gets
+        873  consistent gets <<<============================== consistent gets drop
+          0  physical reads
+          0  redo size
+     144290  bytes sent via SQL*Net to client
+       1160  bytes received via SQL*Net from client
+         69  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+       1019  rows processed
+
+#14 Add clustering to index
+alter table SALES2 add clustering by linear order (customer_id) yes on load yes on data movement;
+
+#15 move table SALES2
+alter table SALES2 move online; 
+
+#16 Check Clustering factor
+		SQL> @idx SALES2
+		
+		INDEX_OWNER               TABLE_NAME                INDEX_NAME                COLUMN_NAME                  COL_POS
+		------------------------- ------------------------- ------------------------- ------------------------- ----------
+		AIOPS_CLIENT              SALES2                    SALES2_CUST_IDX           CUSTOMER_ID                        1
+		AIOPS_CLIENT              SALES2                    SALES2_PK                 ID                                 1
+		
+		OWNER TABLE_NAME                INDEX_NAME                VISIBILIT PAR     BLEVEL DISTINCT_KEYS CLUSTERING_FACTOR UNIQUENES   NUM_ROWS LEAF_BLOCKS SAMPLE_SIZE LAST_ANALYZED
+		----- ------------------------- ------------------------- --------- --- ---------- ------------- ----------------- --------- ---------- ----------- ----------- -------------------
+		AIOPS_CLIENT SALES2             SALES2_PK                 VISIBLE   NO           1        100000             99060 UNIQUE        100000         208      100000 28-11-2024 22:59:17
+		AIOPS_CLIENT SALES2             SALES2_CUST_IDX           VISIBLE   NO           1           100              1786 NONUNIQUE     100000         196      100000 28-11-2024 22:59:17 
+
+		====>>>> clustering_factor index SALES2_CUST_IDX drop to 1786
+
+#17 select table SALES2 and get the exec plan
+select /* after_move */ * from sales2 where customer_id=1;
+		
+	Execution Plan
+	----------------------------------------------------------
+	Plan hash value: 1724231519
+	-------------------------------------------------------------------------------------------------------
+	| Id  | Operation                           | Name            | Rows  | Bytes | Cost (%CPU)| Time     |
+	-------------------------------------------------------------------------------------------------------
+	|   0 | SELECT STATEMENT                    |                 |  1019 |   122K|    21   (0)| 00:00:01 |
+	|   1 |  TABLE ACCESS BY INDEX ROWID BATCHED| SALES2          |  1019 |   122K|    21   (0)| 00:00:01 |
+	|*  2 |   INDEX RANGE SCAN                  | SALES2_CUST_IDX |  1019 |       |     2   (0)| 00:00:01 | <<<=========== index is now used without using hint
+	-------------------------------------------------------------------------------------------------------
+	Predicate Information (identified by operation id):
+	---------------------------------------------------
+	2 - access("CUSTOMER_ID"=1)
+	
+	Statistics
+	----------------------------------------------------------
+			48  recursive calls
+			0  db block gets
+			223  consistent gets <<<<======================== consistent get drop
+			2  physical reads
+			0  redo size
+			144290  bytes sent via SQL*Net to client
+			1156  bytes received via SQL*Net from client
+			69  SQL*Net roundtrips to/from client
+			7  sorts (memory)
+			0  sorts (disk)
+		1019  rows processed
+
+#18 Customer_id column is now sort by the Index (compare with #7)
+SQL> SELECT customer_id, product_id from SALES2 where rownum <= 10;
+
+CUSTOMER_ID PRODUCT_ID
+----------- ----------
+          1          6         
+          1          8         
+          1          4         
+          1          7         
+          1          1         
+          1          5         
+          1          6         
+          1          8         
+          1         10         
+          1         10         
+
+10 rows selected.
+
+
